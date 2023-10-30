@@ -1,27 +1,23 @@
 -module(sslproxy).
 -export([start/0, acceptor/2]).
 
--define(LISTEN_PORT, 8083).
--define(CA_KEY_FILE, "burpkey.pem").
--define(CA_CERT_FILE, "burpcert-fixed.pem").
-
 -define(DLT_RAW, 101).
+
+%% Generic HTTPS proxy for logging non-HTTP traffic in Erlang:
+%% https://github.com/silentsignal/sslproxy
+%% https://blog.silentsignal.eu/2015/10/02/proxying-nonstandard-https-traffic/
 
 -include_lib("public_key/include/public_key.hrl").
 
--record(cert, {cn, der}).
+-record(cert0, {cn, der}).
 -record(rt_cfg, {ca_key_der, ca_key_decoded, ca_cert, passthrough}).
 
 start() ->
 	case file:consult("config.txt") of
 		{ok, Config} ->
-			application:start(crypto),
-			application:start(asn1),
-			application:start(public_key),
-			application:start(ssl),
+			[ application:ensure_all_started(App) || App <- [crypto, ssl] ],
 			ListenPort = proplists:get_value(listen_port, Config),
-			{ok, ProxyListenSock} = gen_tcp:listen(ListenPort, [binary,
-				{active, false}, {packet, http}, {reuseaddr, true}]),
+			{ok, ProxyListenSock} = gen_tcp:listen(ListenPort, [binary, {active, false}, {packet, http}, {reuseaddr, true}]),
 			{ok, PemBin} = file:read_file(proplists:get_value(ca_cert_file, Config)),
 			[{'Certificate', DER, not_encrypted} | _] = public_key:pem_decode(PemBin),
 			{ok, KPemBin} = file:read_file(proplists:get_value(ca_key_file, Config)),
@@ -44,7 +40,7 @@ acceptor(ProxyListenSock, Config) ->
     {PcapFd, Certs} = receive
         {'ETS-TRANSFER', C, Parent, P} when is_pid(Parent) -> {P, C}
     after 0 ->
-        {open_pcap_file(), ets:new(certs, [{keypos, #cert.cn}, public])}
+        {open_pcap_file(), ets:new(certs, [{keypos, #cert0.cn}, public])}
     end,
     {ok, Sock} = gen_tcp:accept(ProxyListenSock),
     Heir = spawn(?MODULE, acceptor, [ProxyListenSock, Config]),
@@ -77,14 +73,18 @@ passthrough(Sock, Host, Port) ->
     end.
 
 mitm_ssl(Sock, Host, Port, Certs, Config) ->
-    {ok, SslSocket} = ssl:ssl_accept(Sock, [{cert, get_cert_for_host(Host, Certs, Config)},
-                                            {key, Config#rt_cfg.ca_key_der},
-                                            {active, true}, {packet, raw}]),
+    {ok, SslSocket} = ssl:handshake(Sock, [ binary
+                                          , {nodelay, true}
+                                          , {active, false}
+                                          , {packet, raw}
+                                          , {cert, get_cert_for_host(Host, Certs, Config)}
+                                          , {key, Config#rt_cfg.ca_key_der} ]),
     io:format("Accepted SSL, connecting to ~s:~p~n", [Host, Port]),
     case ssl_connect_with_fallback(Host, Port) of
         {ok, TargetSock} ->
             case ssl:recv(SslSocket, 0) of
                 {ok, Data} ->
+                    %% io:format("*************** Data: ~p~n", [Data]),
                     calc_ip_headers(SslSocket, TargetSock, ssl),
                     self() ! {ssl, SslSocket, Data},
                     forwarder(SslSocket, TargetSock);
@@ -171,10 +171,12 @@ relay_data(From, To, Data, Module) ->
 
 get_cert_for_host(Host, Certs, Config) ->
     case ets:lookup(Certs, Host) of
-        [C] -> C#cert.der;
+        [C] -> C#cert0.der;
         [] ->
             DER = gen_cert_for_host(Host, Config),
-            ets:insert(Certs, #cert{cn=Host, der=DER}),
+            ets:insert(Certs, #cert0{cn=Host, der=DER}),
+            io:format("***** generate DER for host: ~p~n", [Host]),
+            %% io:format("***** DER : ~p~n", [DER]),
             DER
     end.
 
